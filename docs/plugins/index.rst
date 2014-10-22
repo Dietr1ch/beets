@@ -61,6 +61,8 @@ by typing ``beet version``.
    bucket
    importadded
    bpm
+   spotify
+   types
 
 Autotagger Extensions
 ---------------------
@@ -135,6 +137,8 @@ Miscellaneous
 * :doc:`info`: Print music files' tags to the console.
 * :doc:`missing`: List missing tracks.
 * :doc:`duplicates`: List duplicate tracks or albums.
+* :doc:`spotify`: Create Spotify playlists from the Beets library.
+* :doc:`types`: Declare types for flexible attributes.
 
 .. _MPD: http://www.musicpd.org/
 .. _MPD clients: http://mpd.wikia.com/wiki/Clients
@@ -176,6 +180,8 @@ Here are a few of the plugins written by the beets community:
 
 * `beets-check`_ automatically checksums your files to detect corruption.
 
+* `beets-alternatives`_ manages external files.
+
 .. _beets-check: https://github.com/geigerzaehler/beets-check
 .. _copyartifacts: https://github.com/sbarakat/beets-copyartifacts
 .. _dsedivec: https://github.com/dsedivec/beets-plugins
@@ -187,3 +193,4 @@ Here are a few of the plugins written by the beets community:
     https://github.com/coolkehon/beets/blob/master/beetsplug/cmus.py
 .. _cmus: http://cmus.sourceforge.net/
 .. _beet-amazon: https://github.com/jmwatte/beet-amazon
+.. _beets-alternatives: https://github.com/geigerzaehler/beets-alternatives

@@ -43,7 +43,7 @@ def _missing(album):
         for track_info in getattr(album_info, 'tracks', []):
             if track_info.track_id not in item_mbids:
                 item = _item(track_info, album_info, album.id)
-                log.debug('{0}: track {1} in album {2}'
+                log.debug(u'{0}: track {1} in album {2}'
                           .format(PLUGIN,
                                   track_info.track_id,
                                   album_info.album_id))
@@ -88,7 +88,7 @@ def _item(track_info, album_info, album_id):
         'mb_artistid':        t.artist_id,
         'mb_releasegroupid':  a.releasegroup_id,
         'mb_trackid':         t.track_id,
-        'media':              a.media,
+        'media':              t.media,
         'month':              a.month,
         'script':             a.script,
         'title':              t.title,

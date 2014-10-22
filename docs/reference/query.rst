@@ -156,7 +156,7 @@ Find all items added before the year 2010::
 
     $ beet ls 'added:..2009'
 
-Find all items added on 2008-12-01 but before 2009-10-12::
+Find all items added on or after 2008-12-01 but before 2009-10-12::
 
     $ beet ls 'added:2008-12..2009-10-11'
 
@@ -183,3 +183,30 @@ equivalent::
 Note that this only matches items that are *already in your library*, so a path
 query won't necessarily find *all* the audio files in a directory---just the
 ones you've already added to your beets library.
+
+
+.. _query-sort:
+
+Sort Order
+----------
+
+Queries can specify a sort order. Use the name of the `field` you want to sort
+on, followed by a ``+`` or ``-`` sign to indicate ascending or descending
+sort. For example, this command::
+
+    $ beet list -a year+
+
+will list all albums in chronological order. You can also specify several sort
+orders, which will be used in the same order as they appear in your query::
+
+    $ beet list -a genre+ year+
+
+This command will sort all albums by genre and, in each genre, in chronological
+order.
+
+The ``artist`` and ``albumartist`` keys are special: they attempt to use their
+corresponding ``artist_sort`` and ``albumartist_sort`` fields for sorting
+transparently (but fall back to the ordinary fields when those are empty).
+
+You can set the default sorting behavior with the :ref:`sort_item` and
+:ref:`sort_album` configuration options.

@@ -37,6 +37,8 @@ ALIASES = {
     u'vorbis': u'ogg',
 }
 
+LOSSLESS_FORMATS = ['ape', 'flac', 'alac', 'wav']
+
 
 def replace_ext(path, ext):
     """Return the path with its extension replaced by `ext`.
@@ -90,7 +92,7 @@ def encode(command, source, dest, pretend=False):
     quiet = config['convert']['quiet'].get()
 
     if not quiet and not pretend:
-        log.info(u'Started encoding {0}'.format(util.displayable_path(source)))
+        log.info(u'Encoding {0}'.format(util.displayable_path(source)))
 
     command = Template(command).safe_substitute({
         'source': pipes.quote(source),
@@ -100,10 +102,12 @@ def encode(command, source, dest, pretend=False):
     log.debug(u'convert: executing: {0}'
               .format(util.displayable_path(command)))
 
+    if pretend:
+        log.info(command)
+        return
+
     try:
-        util.command_output(command, shell=True, pretend=pretend)
-        if pretend:
-            return
+        util.command_output(command, shell=True)
     except subprocess.CalledProcessError:
         # Something went wrong (probably Ctrl+C), remove temporary files
         log.info(u'Encoding {0} failed. Cleaning up...'
@@ -122,20 +126,23 @@ def encode(command, source, dest, pretend=False):
         )
 
 
-def should_transcode(item):
+def should_transcode(item, format):
     """Determine whether the item should be transcoded as part of
     conversion (i.e., its bitrate is high or it has the wrong format).
     """
+    if config['convert']['never_convert_lossy_files'] and \
+            not (item.format.lower() in LOSSLESS_FORMATS):
+        return False
     maxbr = config['convert']['max_bitrate'].get(int)
-    format_name = config['convert']['format'].get(unicode)
-    return format_name.lower() != item.format.lower() or \
+    return format.lower() != item.format.lower() or \
         item.bitrate >= 1000 * maxbr
 
 
-def convert_item(dest_dir, keep_new, path_formats, command, ext,
-                 pretend=False):
+def convert_item(dest_dir, keep_new, path_formats, format, pretend=False):
+    command, ext = get_format(format)
+    item, original, converted = None, None, None
     while True:
-        item = yield
+        item = yield (item, original, converted)
         dest = item.destination(basedir=dest_dir, path_formats=path_formats)
 
         # When keeping the new file in the library, we first move the
@@ -143,17 +150,21 @@ def convert_item(dest_dir, keep_new, path_formats, command, ext,
         # back to its old path or transcode it to a new path.
         if keep_new:
             original = dest
-            converted = replace_ext(item.path, ext)
+            converted = item.path
+            if should_transcode(item, format):
+                converted = replace_ext(converted, ext)
         else:
             original = item.path
-            dest = replace_ext(dest, ext)
+            if should_transcode(item, format):
+                dest = replace_ext(dest, ext)
             converted = dest
 
         # Ensure that only one thread tries to create directories at a
         # time. (The existence check is not atomic with the directory
         # creation inside this function.)
-        with _fs_lock:
-            util.mkdirall(dest, pretend)
+        if not pretend:
+            with _fs_lock:
+                util.mkdirall(dest)
 
         if os.path.exists(util.syspath(dest)):
             log.info(u'Skipping {0} (target file exists)'.format(
@@ -162,26 +173,40 @@ def convert_item(dest_dir, keep_new, path_formats, command, ext,
             continue
 
         if keep_new:
-            log.info(u'Moving to {0}'.
-                     format(util.displayable_path(original)))
-            util.move(item.path, original, pretend)
+            if pretend:
+                log.info(u'mv {0} {1}'.format(
+                    util.displayable_path(item.path),
+                    util.displayable_path(original),
+                ))
+            else:
+                log.info(u'Moving to {0}'.format(
+                    util.displayable_path(original))
+                )
+                util.move(item.path, original)
 
-        if not should_transcode(item):
-            # No transcoding necessary.
-            log.info(u'Copying {0}'.format(util.displayable_path(item.path)))
-            util.copy(original, converted, pretend)
-        else:
+        if should_transcode(item, format):
             try:
                 encode(command, original, converted, pretend)
             except subprocess.CalledProcessError:
                 continue
+        else:
+            if pretend:
+                log.info(u'cp {0} {1}'.format(
+                    util.displayable_path(original),
+                    util.displayable_path(converted),
+                ))
+            else:
+                # No transcoding necessary.
+                log.info(u'Copying {0}'.format(
+                    util.displayable_path(item.path))
+                )
+                util.copy(original, converted)
 
         if pretend:
-            # Should we add support for tagging and after_convert plugins?
-            continue  # A yield is used at the start of the loop
+            continue
 
         # Write tags from the database to the converted file.
-        item.write(path=converted)
+        item.try_write(path=converted)
 
         if keep_new:
             # If we're keeping the transcoded file, read it again (after
@@ -195,16 +220,22 @@ def convert_item(dest_dir, keep_new, path_formats, command, ext,
             if album and album.artpath:
                 embed_item(item, album.artpath, itempath=converted)
 
-        plugins.send('after_convert', item=item, dest=dest, keepnew=keep_new)
+        if keep_new:
+            plugins.send('after_convert', item=item,
+                         dest=dest, keepnew=True)
+        else:
+            plugins.send('after_convert', item=item,
+                         dest=converted, keepnew=False)
 
 
 def convert_on_import(lib, item):
     """Transcode a file automatically after it is imported into the
     library.
     """
-    if should_transcode(item):
+    format = config['convert']['format'].get(unicode).lower()
+    if should_transcode(item, format):
         command, ext = get_format()
-        fd, dest = tempfile.mkstemp(ext)
+        fd, dest = tempfile.mkstemp('.' + ext)
         os.close(fd)
         _temp_files.append(dest)  # Delete the transcode later.
         try:
@@ -235,15 +266,13 @@ def convert_func(lib, opts, args):
     if not opts.format:
         opts.format = config['convert']['format'].get(unicode).lower()
 
-    command, ext = get_format(opts.format)
-
     pretend = opts.pretend if opts.pretend is not None else \
-        config['convert']['pretend'].get()
+        config['convert']['pretend'].get(bool)
 
     if not pretend:
         ui.commands.list_items(lib, ui.decargs(args), opts.album, None)
 
-        if not ui.input_yn("Convert? (Y/n)"):
+        if not (opts.yes or ui.input_yn("Convert? (Y/n)")):
             return
 
     if opts.album:
@@ -253,8 +282,7 @@ def convert_func(lib, opts, args):
     convert = [convert_item(opts.dest,
                             opts.keep_new,
                             path_formats,
-                            command,
-                            ext,
+                            opts.format,
                             pretend)
                for _ in range(opts.threads)]
     pipe = util.pipeline.Pipeline([items, convert])
@@ -293,13 +321,14 @@ class ConvertPlugin(BeetsPlugin):
             u'quiet': False,
             u'embed': True,
             u'paths': {},
+            u'never_convert_lossy_files': False,
         })
         self.import_stages = [self.auto_convert]
 
     def commands(self):
         cmd = ui.Subcommand('convert', help='convert to external location')
         cmd.parser.add_option('-p', '--pretend', action='store_true',
-                              help='only show what would happen')
+                              help='show actions but do nothing')
         cmd.parser.add_option('-a', '--album', action='store_true',
                               help='choose albums instead of tracks')
         cmd.parser.add_option('-t', '--threads', action='store', type='int',
@@ -312,6 +341,8 @@ class ConvertPlugin(BeetsPlugin):
                               help='set the destination directory')
         cmd.parser.add_option('-f', '--format', action='store', dest='format',
                               help='set the destination directory')
+        cmd.parser.add_option('-y', '--yes', action='store_true', dest='yes',
+                              help='do not ask for confirmation')
         cmd.func = convert_func
         return [cmd]
 

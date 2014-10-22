@@ -135,7 +135,7 @@ class CommandBackend(Backend):
 
         supported_items = filter(self.format_supported, album.items())
         if len(supported_items) != len(album.items()):
-            log.debug('replaygain: tracks are of unsupported format')
+            log.debug(u'replaygain: tracks are of unsupported format')
             return AlbumGain(None, [])
 
         output = self.compute_gain(supported_items, True)
@@ -198,6 +198,9 @@ class CommandBackend(Backend):
         out = []
         for line in text.split('\n')[1:num_lines + 1]:
             parts = line.split('\t')
+            if len(parts) != 6 or parts[0] == 'File':
+                log.debug(u'replaygain: bad tool output: {0}'.format(text))
+                raise ReplayGainError('mp3gain failed')
             d = {
                 'file': parts[0],
                 'mp3gain': int(parts[1]),
@@ -270,19 +273,25 @@ class GStreamerBackend(object):
 
         try:
             import gi
-            gi.require_version('Gst', '1.0')
-
-            from gi.repository import GObject, Gst, GLib
-            # Calling GObject.threads_init() is not needed for
-            # PyGObject 3.10.2+
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                GObject.threads_init()
-            Gst.init([sys.argv[0]])
-        except:
+        except ImportError:
             raise FatalReplayGainError(
-                "Failed to load GStreamer; check that python-gi is installed"
+                "Failed to load GStreamer: python-gi not found"
             )
+
+        try:
+            gi.require_version('Gst', '1.0')
+        except ValueError as e:
+            raise FatalReplayGainError(
+                "Failed to load GStreamer 1.0: {0}".format(e)
+            )
+
+        from gi.repository import GObject, Gst, GLib
+        # Calling GObject.threads_init() is not needed for
+        # PyGObject 3.10.2+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            GObject.threads_init()
+        Gst.init([sys.argv[0]])
 
         self.GObject = GObject
         self.GLib = GLib
@@ -495,7 +504,7 @@ class ReplayGainPlugin(BeetsPlugin):
             )
         except (ReplayGainError, FatalReplayGainError) as e:
             raise ui.UserError(
-                'An error occurred in backend initialization: {0}'.format(e)
+                'replaygain initialization failed: {0}'.format(e)
             )
 
     def track_requires_gain(self, item):
@@ -577,12 +586,12 @@ class ReplayGainPlugin(BeetsPlugin):
         in the item, nothing is done.
         """
         if not self.track_requires_gain(item):
-            log.info(u'Skipping track {0} - {1}'.format(item.artist,
-                                                        item.title))
+            log.info(u'Skipping track {0} - {1}'
+                     .format(item.artist, item.title))
             return
 
-        log.info(u'analyzing {0} - {1}'.format(item.artist,
-                                               item.title))
+        log.info(u'analyzing {0} - {1}'
+                 .format(item.artist, item.title))
 
         try:
             track_gains = self.backend_instance.compute_track_gain([item])

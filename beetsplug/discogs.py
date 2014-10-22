@@ -17,9 +17,10 @@ discogs-client library.
 """
 from beets.autotag.hooks import AlbumInfo, TrackInfo, Distance
 from beets.plugins import BeetsPlugin
-from discogs_client import DiscogsAPIError, Release, Search
+from discogs_client import Release, Client
+from discogs_client.exceptions import DiscogsAPIError
+from requests.exceptions import ConnectionError
 import beets
-import discogs_client
 import logging
 import re
 import time
@@ -30,10 +31,6 @@ log = logging.getLogger('beets')
 urllib3_logger = logging.getLogger('requests.packages.urllib3')
 urllib3_logger.setLevel(logging.CRITICAL)
 
-# Set user-agent for discogs client.
-discogs_client.user_agent = 'beets/%s +http://beets.radbox.org/' % \
-    beets.__version__
-
 
 class DiscogsPlugin(BeetsPlugin):
 
@@ -42,6 +39,8 @@ class DiscogsPlugin(BeetsPlugin):
         self.config.add({
             'source_weight': 0.5,
         })
+        self.discogs_client = Client('beets/%s +http://beets.radbox.org/' %
+                                     beets.__version__)
 
     def album_distance(self, items, album_info, mapping):
         """Returns the album distance.
@@ -62,14 +61,17 @@ class DiscogsPlugin(BeetsPlugin):
         try:
             return self.get_albums(query)
         except DiscogsAPIError as e:
-            log.debug('Discogs API Error: %s (query: %s' % (e, query))
+            log.debug(u'Discogs API Error: {0} (query: {1})'.format(e, query))
+            return []
+        except ConnectionError as e:
+            log.debug(u'HTTP Connection Error: {0}'.format(e))
             return []
 
     def album_for_id(self, album_id):
         """Fetches an album by its Discogs ID and returns an AlbumInfo object
         or None if the album is not found.
         """
-        log.debug('Searching discogs for release %s' % str(album_id))
+        log.debug(u'Searching Discogs for release {0}'.format(str(album_id)))
         # Discogs-IDs are simple integers. We only look for those at the end
         # of an input string as to avoid confusion with other metadata plugins.
         # An optional bracket can follow the integer, as this is how discogs
@@ -78,14 +80,17 @@ class DiscogsPlugin(BeetsPlugin):
                           album_id)
         if not match:
             return None
-        result = Release(match.group(2))
+        result = Release(self.discogs_client, {'id': int(match.group(2))})
         # Try to obtain title to verify that we indeed have a valid Release
         try:
             getattr(result, 'title')
         except DiscogsAPIError as e:
             if e.message != '404 Not Found':
-                log.debug('Discogs API Error: %s (query: %s)'
-                          % (e, result._uri))
+                log.debug(u'Discogs API Error: {0} (query: {1})'
+                          .format(e, result._uri))
+            return None
+        except ConnectionError as e:
+            log.debug(u'HTTP Connection Error: {0}'.format(e))
             return None
         return self.get_album_info(result)
 
@@ -96,24 +101,19 @@ class DiscogsPlugin(BeetsPlugin):
         # cause a query to return no results, even if they match the artist or
         # album title. Use `re.UNICODE` flag to avoid stripping non-english
         # word characters.
-        query = re.sub(r'(?u)\W+', ' ', query)
+        query = re.sub(r'(?u)\W+', ' ', query).encode('utf8')
         # Strip medium information from query, Things like "CD1" and "disk 1"
         # can also negate an otherwise positive result.
         query = re.sub(r'(?i)\b(CD|disc)\s*\d+', '', query)
-        albums = []
-        for result in Search(query).results():
-            if isinstance(result, Release):
-                albums.append(self.get_album_info(result))
-            if len(albums) >= 5:
-                break
-        return albums
+        releases = self.discogs_client.search(query, type='release').page(1)
+        return [self.get_album_info(release) for release in releases[:5]]
 
     def get_album_info(self, result):
         """Returns an AlbumInfo object for a discogs Release object.
         """
+        artist, artist_id = self.get_artist([a.data for a in result.artists])
         album = re.sub(r' +', ' ', result.title)
         album_id = result.data['id']
-        artist, artist_id = self.get_artist(result.data['artists'])
         # Use `.data` to access the tracklist directly instead of the
         # convenient `.tracklist` property, which will strip out useful artist
         # information and leave us with skeleton `Artist` objects that will
@@ -232,7 +232,7 @@ class DiscogsPlugin(BeetsPlugin):
         if match:
             medium, index = match.groups()
         else:
-            log.debug('Invalid discogs position: %s' % position)
+            log.debug(u'Invalid Discogs position: {0}'.format(position))
             medium = index = None
         return medium or None, index or None
 

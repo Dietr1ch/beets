@@ -154,11 +154,12 @@ def _safe_cast(out_type, val):
         else:
             if not isinstance(val, basestring):
                 val = unicode(val)
-            val = re.match(r'[\+-]?[0-9\.]*', val.strip()).group(0)
-            if not val:
-                return 0.0
-            else:
-                return float(val)
+            match = re.match(r'[\+-]?[0-9\.]+', val.strip())
+            if match:
+                val = match.group(0)
+                if val:
+                    return float(val)
+            return 0.0
 
     else:
         return val
@@ -410,7 +411,7 @@ class StorageStyle(object):
         """
         try:
             return mutagen_file[self.key][0]
-        except KeyError:
+        except (KeyError, IndexError):
             return None
 
     def deserialize(self, mutagen_value):
@@ -664,7 +665,7 @@ class MP3StorageStyle(StorageStyle):
     def fetch(self, mutagen_file):
         try:
             return mutagen_file[self.key].text[0]
-        except KeyError:
+        except (KeyError, IndexError):
             return None
 
     def store(self, mutagen_file, value):
@@ -1121,13 +1122,15 @@ class DateField(MediaField):
         """
         if year is None:
             self.__delete__(mediafile)
-        date = [year]
+            return
+
+        date = [u'{0:04d}'.format(int(year))]
         if month:
-            date.append(month)
+            date.append(u'{0:02d}'.format(int(month)))
         if month and day:
-            date.append(day)
+            date.append(u'{0:02d}'.format(int(day)))
         date = map(unicode, date)
-        super(DateField, self).__set__(mediafile, '-'.join(date))
+        super(DateField, self).__set__(mediafile, u'-'.join(date))
 
         if hasattr(self, '_year_field'):
             self._year_field.__set__(mediafile, year)
@@ -1222,9 +1225,12 @@ class MediaFile(object):
     """Represents a multimedia file on disk and provides access to its
     metadata.
     """
-    def __init__(self, path):
+    def __init__(self, path, id3v23=False):
         """Constructs a new `MediaFile` reflecting the file at path. May
         throw `UnreadableFileError`.
+
+        By default, MP3 files are saved with ID3v2.4 tags. You can use
+        the older ID3v2.3 standard by specifying the `id3v23` option.
         """
         self.path = path
 
@@ -1257,7 +1263,7 @@ class MediaFile(object):
         except Exception as exc:
             # Isolate bugs in Mutagen.
             log.debug(traceback.format_exc())
-            log.error('uncaught Mutagen exception in open: {0}'.format(exc))
+            log.error(u'uncaught Mutagen exception in open: {0}'.format(exc))
             raise MutagenError(path, exc)
 
         if self.mgfile is None:
@@ -1296,18 +1302,19 @@ class MediaFile(object):
         else:
             raise FileTypeError(path, type(self.mgfile).__name__)
 
-        # add a set of tags if it's missing
+        # Add a set of tags if it's missing.
         if self.mgfile.tags is None:
             self.mgfile.add_tags()
 
-    def save(self, id3v23=False):
-        """Write the object's tags back to the file.
+        # Set the ID3v2.3 flag only for MP3s.
+        self.id3v23 = id3v23 and self.type == 'mp3'
 
-        By default, MP3 files are saved with ID3v2.4 tags. You can use
-        the older ID3v2.3 standard by specifying the `id3v23` option.
+    def save(self):
+        """Write the object's tags back to the file.
         """
+        # Possibly save the tags to ID3v2.3.
         kwargs = {}
-        if id3v23 and self.type == 'mp3':
+        if self.id3v23:
             id3 = self.mgfile
             if hasattr(id3, 'tags'):
                 # In case this is an MP3 object, not an ID3 object.
@@ -1323,7 +1330,7 @@ class MediaFile(object):
             raise
         except Exception as exc:
             log.debug(traceback.format_exc())
-            log.error('uncaught Mutagen exception in save: {0}'.format(exc))
+            log.error(u'uncaught Mutagen exception in save: {0}'.format(exc))
             raise MutagenError(self.path, exc)
 
     def delete(self):

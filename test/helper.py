@@ -35,6 +35,7 @@ import os
 import os.path
 import shutil
 import subprocess
+import logging
 from tempfile import mkdtemp, mkstemp
 from contextlib import contextmanager
 from StringIO import StringIO
@@ -43,13 +44,34 @@ from enum import Enum
 import beets
 from beets import config
 import beets.plugins
-from beets.library import Library, Item
+from beets.library import Library, Item, Album
 from beets import importer
 from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.mediafile import MediaFile
 
 # TODO Move AutotagMock here
 import _common
+
+
+class LogCapture(logging.Handler):
+
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(str(record.msg))
+
+
+@contextmanager
+def capture_log(logger='beets'):
+    capture = LogCapture()
+    log = logging.getLogger(logger)
+    log.addHandler(capture)
+    try:
+        yield capture.messages
+    finally:
+        log.removeHandler(capture)
 
 
 @contextmanager
@@ -80,12 +102,13 @@ def capture_stdout():
     'spam'
     """
     org = sys.stdout
-    sys.stdout = StringIO()
+    sys.stdout = capture = StringIO()
     sys.stdout.encoding = 'utf8'
     try:
         yield sys.stdout
     finally:
         sys.stdout = org
+        print(capture.getvalue())
 
 
 def has_program(cmd, args=['--version']):
@@ -155,7 +178,8 @@ class TestHelper(object):
 
     def teardown_beets(self):
         del self.lib._connections
-        del os.environ['BEETSDIR']
+        if 'BEETSDIR' in os.environ:
+            del os.environ['BEETSDIR']
         self.remove_temp_dir()
         self.config.clear()
         beets.config.read(user=False, defaults=True)
@@ -166,18 +190,24 @@ class TestHelper(object):
         Similar setting a list of plugins in the configuration. Make
         sure you call ``unload_plugins()`` afterwards.
         """
+        # FIXME this should eventually be handled by a plugin manager
         beets.config['plugins'] = plugins
         beets.plugins.load_plugins(plugins)
         beets.plugins.find_plugins()
+        Item._types = beets.plugins.types(Item)
+        Album._types = beets.plugins.types(Album)
 
     def unload_plugins(self):
         """Unload all plugins and remove the from the configuration.
         """
+        # FIXME this should eventually be handled by a plugin manager
         beets.config['plugins'] = []
         for plugin in beets.plugins._classes:
             plugin.listeners = None
         beets.plugins._classes = set()
         beets.plugins._instances = {}
+        Item._types = {}
+        Album._types = {}
 
     def create_importer(self, item_count=1, album_count=1):
         """Create files to import and return corresponding session.
@@ -228,15 +258,75 @@ class TestHelper(object):
         return TestImportSession(self.lib, logfile=None, query=None,
                                  paths=[import_dir])
 
+    # Library fixtures methods
+
+    def create_item(self, **values):
+        """Return an `Item` instance with sensible default values.
+
+        The item receives its attributes from `**values` paratmeter. The
+        `title`, `artist`, `album`, `track`, `format` and `path`
+        attributes have defaults if they are not given as parameters.
+        The `title` attribute is formated with a running item count to
+        prevent duplicates. The default for the `path` attribute
+        respects the `format` value.
+
+        The item is attached to the database from `self.lib`.
+        """
+        item_count = self._get_item_count()
+        values_ = {
+            'title': u't\u00eftle {0}',
+            'artist': u'the \u00e4rtist',
+            'album': u'the \u00e4lbum',
+            'track': item_count,
+            'format': 'MP3',
+        }
+        values_.update(values)
+        values_['title'] = values_['title'].format(item_count)
+        values_['db'] = self.lib
+        item = Item(**values_)
+        if 'path' not in values:
+            item['path'] = 'audio.' + item['format'].lower()
+        return item
+
+    def add_item(self, **values):
+        """Add an item to the library and return it.
+
+        Creates the item by passing the parameters to `create_item()`.
+
+        If `path` is not set in `values` it is set to `item.destination()`.
+        """
+        item = self.create_item(**values)
+        item.add(self.lib)
+        if 'path' not in values:
+            item['path'] = item.destination()
+            item.store()
+        return item
+
+    def add_item_fixture(self, **values):
+        """Add an item with an actual audio file to the library.
+        """
+        item = self.create_item(**values)
+        extension = item['format'].lower()
+        item['path'] = os.path.join(_common.RSRC, 'min.' + extension)
+        item.add(self.lib)
+        item.move(copy=True)
+        item.store()
+        return item
+
+    def add_album(self, **values):
+        item = self.add_item(**values)
+        return self.lib.add_album([item])
+
     def add_item_fixtures(self, ext='mp3', count=1):
         """Add a number of items with files to the database.
         """
+        # TODO base this on `add_item()`
         items = []
         path = os.path.join(_common.RSRC, 'full.' + ext)
         for i in range(count):
             item = Item.from_path(str(path))
-            item.album = u'\xc3\xa4lbum {0}'.format(i)  # Check unicode paths
-            item.title = u't\xc3\x8ftle {0}'.format(i)
+            item.album = u'\u00e4lbum {0}'.format(i)  # Check unicode paths
+            item.title = u't\u00eftle {0}'.format(i)
             item.add(self.lib)
             item.move(copy=True)
             item.store()
@@ -281,12 +371,27 @@ class TestHelper(object):
             for path in self._mediafile_fixtures:
                 os.remove(path)
 
+    def _get_item_count(self):
+        if not hasattr(self, '__item_count'):
+            count = 0
+        self.__item_count = count + 1
+        return count
+
+    # Running beets commands
+
     def run_command(self, *args):
         if hasattr(self, 'lib'):
             lib = self.lib
         else:
             lib = Library(':memory:')
         beets.ui._raw_main(list(args), lib)
+
+    def run_with_output(self, *args):
+        with capture_stdout() as out:
+            self.run_command(*args)
+        return out.getvalue()
+
+    # Safe file operations
 
     def create_temp_dir(self):
         """Create a temporary directory and assign it into
@@ -298,6 +403,27 @@ class TestHelper(object):
         """Delete the temporary directory created by `create_temp_dir`.
         """
         shutil.rmtree(self.temp_dir)
+
+    def touch(self, path, dir=None, content=''):
+        """Create a file at `path` with given content.
+
+        If `dir` is given, it is prepended to `path`. After that, if the
+        path is relative, it is resolved with respect to
+        `self.temp_dir`.
+        """
+        if dir:
+            path = os.path.join(dir, path)
+
+        if not os.path.isabs(path):
+            path = os.path.join(self.temp_dir, path)
+
+        parent = os.path.dirname(path)
+        if not os.path.isdir(parent):
+            os.makedirs(parent)
+
+        with open(path, 'a+') as f:
+            f.write(content)
+        return path
 
 
 class TestImportSession(importer.ImportSession):
@@ -351,7 +477,7 @@ class TestImportSession(importer.ImportSession):
         assert isinstance(resolution, self.Resolution)
         self._resolutions.append(resolution)
 
-    def resolve_duplicate(self, task):
+    def resolve_duplicate(self, task, found_duplicates):
         try:
             res = self._resolutions.pop(0)
         except IndexError:

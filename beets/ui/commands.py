@@ -20,7 +20,6 @@ from __future__ import print_function
 import logging
 import os
 import time
-import itertools
 import codecs
 import platform
 import re
@@ -319,17 +318,9 @@ def show_change(cur_artist, cur_album, match):
                 color = 'lightgray'
             else:
                 color = 'red'
-            if (cur_track + new_track).count('-') == 1:
-                lhs_track, rhs_track = (ui.colorize(color, cur_track),
-                                        ui.colorize(color, new_track))
-            else:
-                color = 'red'
-                lhs_track, rhs_track = ui.color_diff_suffix(cur_track,
-                                                            new_track)
-            templ = (ui.colorize(color, u' (#') + u'{0}' +
-                     ui.colorize(color, u')'))
-            lhs += templ.format(lhs_track)
-            rhs += templ.format(rhs_track)
+            templ = ui.colorize(color, u' (#{0})')
+            lhs += templ.format(cur_track)
+            rhs += templ.format(new_track)
             lhs_width += len(cur_track) + 4
 
         # Length change.
@@ -338,12 +329,9 @@ def show_change(cur_artist, cur_album, match):
                 config['ui']['length_diff_thresh'].as_number():
             cur_length = ui.human_seconds_short(item.length)
             new_length = ui.human_seconds_short(track_info.length)
-            lhs_length, rhs_length = ui.color_diff_suffix(cur_length,
-                                                          new_length)
-            templ = (ui.colorize('red', u' (') + u'{0}' +
-                     ui.colorize('red', u')'))
-            lhs += templ.format(lhs_length)
-            rhs += templ.format(rhs_length)
+            templ = ui.colorize('red', u' ({0})')
+            lhs += templ.format(cur_length)
+            rhs += templ.format(new_length)
             lhs_width += len(cur_length) + 3
 
         # Penalties.
@@ -422,6 +410,37 @@ def show_item_change(item, match):
     if disambig:
         info.append(ui.colorize('lightgray', '(%s)' % disambig))
     print_(' '.join(info))
+
+
+def summarize_items(items, singleton):
+    """Produces a brief summary line describing a set of items. Used for
+    manually resolving duplicates during import.
+
+    `items` is a list of `Item` objects. `singleton` indicates whether
+    this is an album or single-item import (if the latter, them `items`
+    should only have one element).
+    """
+    summary_parts = []
+    if not singleton:
+        summary_parts.append("{0} items".format(len(items)))
+
+    format_counts = {}
+    for item in items:
+        format_counts[item.format] = format_counts.get(item.format, 0) + 1
+    if len(format_counts) == 1:
+        # A single format.
+        summary_parts.append(items[0].format)
+    else:
+        # Enumerate all the formats.
+        for format, count in format_counts.iteritems():
+            summary_parts.append('{0} {1}'.format(format, count))
+
+    average_bitrate = sum([item.bitrate for item in items]) / len(items)
+    total_duration = sum([item.length for item in items])
+    summary_parts.append('{0}kbps'.format(int(average_bitrate / 1000)))
+    summary_parts.append(ui.human_seconds_short(total_duration))
+
+    return ', '.join(summary_parts)
 
 
 def _summary_judment(rec):
@@ -741,18 +760,30 @@ class TerminalImportSession(importer.ImportSession):
                 assert isinstance(choice, autotag.TrackMatch)
                 return choice
 
-    def resolve_duplicate(self, task):
+    def resolve_duplicate(self, task, found_duplicates):
         """Decide what to do when a new album or item seems similar to one
         that's already in the library.
         """
-        log.warn("This %s is already in the library!" %
-                 ("album" if task.is_album else "item"))
+        log.warn(u"This {0} is already in the library!"
+                 .format("album" if task.is_album else "item"))
 
         if config['import']['quiet']:
             # In quiet mode, don't prompt -- just skip.
-            log.info('Skipping.')
+            log.info(u'Skipping.')
             sel = 's'
         else:
+            # Print some detail about the existing and new items so the
+            # user can make an informed decision.
+            for duplicate in found_duplicates:
+                print("Old: " + summarize_items(
+                    list(duplicate.items()) if task.is_album else [duplicate],
+                    not task.is_album,
+                ))
+            print("New: " + summarize_items(
+                task.imported_items(),
+                not task.is_album,
+            ))
+
             sel = ui.input_options(
                 ('Skip new', 'Keep both', 'Remove old')
             )
@@ -979,8 +1010,8 @@ def update_items(lib, query, album, move, pretend):
 
             # Did the item change since last checked?
             if item.current_mtime() <= item.mtime:
-                log.debug(u'skipping %s because mtime is up to date (%i)' %
-                          (displayable_path(item.path), item.mtime))
+                log.debug(u'skipping {0} because mtime is up to date ({1})'
+                          .format(displayable_path(item.path), item.mtime))
                 continue
 
             # Read new data.
@@ -1030,7 +1061,7 @@ def update_items(lib, query, album, move, pretend):
                 continue
             album = lib.get_album(album_id)
             if not album:  # Empty albums have already been removed.
-                log.debug('emptied album %i' % album_id)
+                log.debug(u'emptied album {0}'.format(album_id))
                 continue
             first_item = album.items().get()
 
@@ -1041,7 +1072,7 @@ def update_items(lib, query, album, move, pretend):
 
             # Move album art (and any inconsistent items).
             if move and lib.directory in ancestry(first_item.path):
-                log.debug('moving album %i' % album_id)
+                log.debug(u'moving album {0}'.format(album_id))
                 album.move()
 
 
@@ -1135,6 +1166,7 @@ def show_stats(lib, query, exact):
     total_items = 0
     artists = set()
     albums = set()
+    album_artists = set()
 
     for item in items:
         if exact:
@@ -1144,7 +1176,9 @@ def show_stats(lib, query, exact):
         total_time += item.length
         total_items += 1
         artists.add(item.artist)
-        albums.add(item.album)
+        album_artists.add(item.albumartist)
+        if item.album_id:
+            albums.add(item.album_id)
 
     size_str = '' + ui.human_bytes(total_size)
     if exact:
@@ -1154,8 +1188,10 @@ def show_stats(lib, query, exact):
 Total time: {1} ({2:.2f} seconds)
 Total size: {3}
 Artists: {4}
-Albums: {5}""".format(total_items, ui.human_seconds(total_time), total_time,
-                      size_str, len(artists), len(albums)))
+Albums: {5}
+Album artists: {6}""".format(total_items, ui.human_seconds(total_time),
+                             total_time, size_str, len(artists), len(albums),
+                             len(album_artists)))
 
 
 def stats_func(lib, opts, args):
@@ -1196,15 +1232,16 @@ default_commands.append(version_cmd)
 
 def modify_items(lib, mods, dels, query, write, move, album, confirm):
     """Modifies matching items according to user-specified assignments and
-    deletions. `mods` is a list of "field=value" strings indicating
+    deletions.
+
+    `mods` is a dictionary of field and value pairse indicating
     assignments. `dels` is a list of fields to be deleted.
     """
     # Parse key=value specifications into a dictionary.
     model_cls = library.Album if album else library.Item
-    fsets = {}
-    for mod in mods:
-        key, value = mod.split('=', 1)
-        fsets[key] = model_cls._parse(key, value)
+
+    for key, value in mods.items():
+        mods[key] = model_cls._parse(key, value)
 
     # Get the items to modify.
     items, albums = _do_query(lib, query, album, False)
@@ -1212,11 +1249,11 @@ def modify_items(lib, mods, dels, query, write, move, album, confirm):
 
     # Apply changes *temporarily*, preview them, and collect modified
     # objects.
-    print_('Modifying %i %ss.' % (len(objs), 'album' if album else 'item'))
+    print_('Modifying {0} {1}s.'
+           .format(len(objs), 'album' if album else 'item'))
     changed = set()
     for obj in objs:
-        for field, value in fsets.iteritems():
-            obj[field] = value
+        obj.update(mods)
         for field in dels:
             del obj[field]
         if ui.show_model_changes(obj):
@@ -1241,25 +1278,17 @@ def modify_items(lib, mods, dels, query, write, move, album, confirm):
         if not ui.input_yn('Really modify%s (Y/n)?' % extra):
             return
 
-    # Apply changes to database.
+    # Apply changes to database and files
     with lib.transaction():
         for obj in changed:
             if move:
                 cur_path = obj.path
                 if lib.directory in ancestry(cur_path):  # In library?
-                    log.debug('moving object %s' % cur_path)
+                    log.debug(u'moving object {0}'
+                              .format(displayable_path(cur_path)))
                     obj.move()
 
-            obj.store()
-
-    # Apply tags if requested.
-    if write:
-        if album:
-            changed_items = itertools.chain(*(a.items() for a in changed))
-        else:
-            changed_items = changed
-        for item in changed_items:
-            item.try_write()
+            obj.try_sync(write)
 
 
 def modify_parse_args(args):
@@ -1267,14 +1296,15 @@ def modify_parse_args(args):
     assignments (field=value), and deletions (field!).  Returns the result as
     a three-tuple in that order.
     """
-    mods = []
+    mods = {}
     dels = []
     query = []
     for arg in args:
         if arg.endswith('!') and '=' not in arg and ':' not in arg:
             dels.append(arg[:-1])  # Strip trailing !.
         elif '=' in arg and ':' not in arg.split('=', 1)[0]:
-            mods.append(arg)
+            key, val = arg.split('=', 1)
+            mods[key] = val
         else:
             query.append(arg)
     return query, mods, dels
@@ -1333,9 +1363,9 @@ def move_items(lib, dest, query, copy, album):
 
     action = 'Copying' if copy else 'Moving'
     entity = 'album' if album else 'item'
-    log.info('%s %i %ss.' % (action, len(objs), entity))
+    log.info(u'{0} {1} {2}s.'.format(action, len(objs), entity))
     for obj in objs:
-        log.debug('moving: %s' % obj.path)
+        log.debug(u'moving: {0}'.format(util.displayable_path(obj.path)))
 
         obj.move(copy, basedir=dest)
         obj.store()
@@ -1372,7 +1402,7 @@ default_commands.append(move_cmd)
 
 # write: Write tags into files.
 
-def write_items(lib, query, pretend):
+def write_items(lib, query, pretend, force):
     """Write tag information from the database to the respective files
     in the filesystem.
     """
@@ -1397,19 +1427,23 @@ def write_items(lib, query, pretend):
 
         # Check for and display changes.
         changed = ui.show_model_changes(item, clean_item,
-                                        library.Item._media_fields)
-        if changed and not pretend:
-            item.try_write()
+                                        library.Item._media_fields, force)
+        if (changed or force) and not pretend:
+            item.try_sync()
 
 
 def write_func(lib, opts, args):
-    write_items(lib, decargs(args), opts.pretend)
+    write_items(lib, decargs(args), opts.pretend, opts.force)
 
 
 write_cmd = ui.Subcommand('write', help='write tag information to files')
 write_cmd.parser.add_option(
     '-p', '--pretend', action='store_true',
     help="show all changes but do nothing"
+)
+write_cmd.parser.add_option(
+    '-f', '--force', action='store_true',
+    help="write tags even if the existing tags match the database"
 )
 write_cmd.func = write_func
 default_commands.append(write_cmd)

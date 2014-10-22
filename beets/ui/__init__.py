@@ -441,30 +441,6 @@ def colordiff(a, b, highlight='red'):
         return unicode(a), unicode(b)
 
 
-def color_diff_suffix(a, b, highlight='red'):
-    """Colorize the differing suffix between two strings."""
-    a, b = unicode(a), unicode(b)
-    if not config['color']:
-        return a, b
-
-    # Fast path.
-    if a == b:
-        return a, b
-
-    # Find the longest common prefix.
-    first_diff = None
-    for i in range(min(len(a), len(b))):
-        if a[i] != b[i]:
-            first_diff = i
-            break
-    else:
-        first_diff = min(len(a), len(b))
-
-    # Colorize from the first difference on.
-    return (a[:first_diff] + colorize(highlight, a[first_diff:]),
-            b[:first_diff] + colorize(highlight, b[first_diff:]))
-
-
 def get_path_formats(subview=None):
     """Get the configuration's path formats as a list of query/template
     pairs.
@@ -492,21 +468,6 @@ def get_replacements():
                 )
             )
     return replacements
-
-
-def get_plugin_paths():
-    """Get the list of search paths for plugins from the config file.
-    The value for "pluginpath" may be a single string or a list of
-    strings.
-    """
-    pluginpaths = config['pluginpath'].get()
-    if isinstance(pluginpaths, basestring):
-        pluginpaths = [pluginpaths]
-    if not isinstance(pluginpaths, list):
-        raise confit.ConfigTypeError(
-            u'pluginpath must be string or a list of strings'
-        )
-    return map(util.normpath, pluginpaths)
 
 
 def _pick_format(album, fmt=None):
@@ -576,8 +537,8 @@ def _field_diff(field, old, new):
         return None
 
     # Get formatted values for output.
-    oldstr = old.formatted.get(field, u'')
-    newstr = new.formatted.get(field, u'')
+    oldstr = old.formatted().get(field, u'')
+    newstr = new.formatted().get(field, u'')
 
     # For strings, highlight changes. For others, colorize the whole
     # thing.
@@ -620,7 +581,7 @@ def show_model_changes(new, old=None, fields=None, always=False):
 
         changes.append(u'  {0}: {1}'.format(
             field,
-            colorize('red', new.formatted[field])
+            colorize('red', new.formatted()[field])
         ))
 
     # Print changes.
@@ -779,6 +740,8 @@ class SubcommandsOptionParser(optparse.OptionParser):
         # Force the help command
         if options.help:
             subargs = ['help']
+        elif options.version:
+            subargs = ['version']
         return options, subargs
 
     def parse_subcommand(self, args):
@@ -840,49 +803,52 @@ def vararg_callback(option, opt_str, value, parser):
 
 # The main entry point and bootstrapping.
 
-def _load_plugins():
+def _load_plugins(config):
     """Load the plugins specified in the configuration.
     """
-    # Add plugin paths.
+    paths = config['pluginpath'].get(confit.StrSeq(split=False))
+    paths = map(util.normpath, paths)
+
     import beetsplug
-    beetsplug.__path__ = get_plugin_paths() + beetsplug.__path__
-
+    beetsplug.__path__ = paths + beetsplug.__path__
     # For backwards compatibility.
-    sys.path += get_plugin_paths()
+    sys.path += paths
 
-    # Load requested plugins.
     plugins.load_plugins(config['plugins'].as_str_seq())
     plugins.send("pluginload")
+    return plugins
 
 
-def _configure(args):
-    """Parse the command line, load configuration files (including
-    loading any indicated plugins), and return the invoked subcomand,
-    the subcommand options, and the subcommand arguments.
+def _setup(options, lib=None):
+    """Prepare and global state and updates it with command line options.
+
+    Returns a list of subcommands, a list of plugins, and a library instance.
     """
-    # Temporary: Migrate from 1.0-style configuration.
-    from beets.ui import migrate
-    migrate.automigrate()
+    # Configure the MusicBrainz API.
+    mb.configure()
+
+    config = _configure(options)
+
+    plugins = _load_plugins(config)
 
     # Get the default subcommands.
     from beets.ui.commands import default_commands
 
-    # Construct the root parser.
-    parser = SubcommandsOptionParser()
-    parser.add_option('-l', '--library', dest='library',
-                      help='library database file to use')
-    parser.add_option('-d', '--directory', dest='directory',
-                      help="destination music directory")
-    parser.add_option('-v', '--verbose', dest='verbose', action='store_true',
-                      help='print debugging information')
-    parser.add_option('-c', '--config', dest='config',
-                      help='path to configuration file')
-    parser.add_option('-h', '--help', dest='help', action='store_true',
-                      help='how this help message and exit')
+    subcommands = list(default_commands)
+    subcommands.extend(plugins.commands())
 
-    # Parse the command-line!
-    options, subargs = parser.parse_global_options(args)
+    if lib is None:
+        lib = _open_library(config)
+        plugins.send("library_opened", lib=lib)
+    library.Item._types = plugins.types(library.Item)
+    library.Album._types = plugins.types(library.Album)
 
+    return subcommands, plugins, lib
+
+
+def _configure(options):
+    """Amend the global configuration object with command line options.
+    """
     # Add any additional config files specified with --config. This
     # special handling lets specified plugins get loaded before we
     # finish parsing the command line.
@@ -900,61 +866,64 @@ def _configure(args):
 
     config_path = config.user_config_path()
     if os.path.isfile(config_path):
-        log.debug('user configuration: {0}'.format(
+        log.debug(u'user configuration: {0}'.format(
             util.displayable_path(config_path)))
     else:
-        log.debug('no user configuration found at {0}'.format(
+        log.debug(u'no user configuration found at {0}'.format(
             util.displayable_path(config_path)))
 
-    # Add builtin subcommands
-    parser.add_subcommand(*default_commands)
-    parser.add_subcommand(migrate.migrate_cmd)
+    log.debug(u'data directory: {0}'
+              .format(util.displayable_path(config.config_dir())))
+    return config
 
-    # Now add the plugin commands to the parser.
-    _load_plugins()
-    for cmd in plugins.commands():
-        parser.add_subcommand(cmd)
 
-    # Parse the remainder of the command line with loaded plugins.
-    return parser.parse_subcommand(subargs)
+def _open_library(config):
+    """Create a new library instance from the configuration.
+    """
+    dbpath = config['library'].as_filename()
+    try:
+        lib = library.Library(
+            dbpath,
+            config['directory'].as_filename(),
+            get_path_formats(),
+            get_replacements(),
+        )
+    except sqlite3.OperationalError:
+        raise UserError(u"database file {0} could not be opened".format(
+            util.displayable_path(dbpath)
+        ))
+    log.debug(u'library database: {0}\n'
+              u'library directory: {1}'
+              .format(util.displayable_path(lib.path),
+                      util.displayable_path(lib.directory)))
+    return lib
 
 
 def _raw_main(args, lib=None):
     """A helper function for `main` without top-level exception
     handling.
     """
-    subcommand, suboptions, subargs = _configure(args)
+    parser = SubcommandsOptionParser()
+    parser.add_option('-l', '--library', dest='library',
+                      help='library database file to use')
+    parser.add_option('-d', '--directory', dest='directory',
+                      help="destination music directory")
+    parser.add_option('-v', '--verbose', dest='verbose', action='store_true',
+                      help='print debugging information')
+    parser.add_option('-c', '--config', dest='config',
+                      help='path to configuration file')
+    parser.add_option('-h', '--help', dest='help', action='store_true',
+                      help='how this help message and exit')
+    parser.add_option('--version', dest='version', action='store_true',
+                      help=optparse.SUPPRESS_HELP)
 
-    if lib is None:
-        # Open library file.
-        dbpath = config['library'].as_filename()
-        try:
-            lib = library.Library(
-                dbpath,
-                config['directory'].as_filename(),
-                get_path_formats(),
-                get_replacements(),
-            )
-        except sqlite3.OperationalError:
-            raise UserError(u"database file {0} could not be opened".format(
-                util.displayable_path(dbpath)
-            ))
-        plugins.send("library_opened", lib=lib)
+    options, subargs = parser.parse_global_options(args)
+    subcommands, plugins, lib = _setup(options, lib)
+    parser.add_subcommand(*subcommands)
 
-    log.debug(u'data directory: {0}\n'
-              u'library database: {1}\n'
-              u'library directory: {2}'
-              .format(
-                  util.displayable_path(config.config_dir()),
-                  util.displayable_path(lib.path),
-                  util.displayable_path(lib.directory),
-              ))
-
-    # Configure the MusicBrainz API.
-    mb.configure()
-
-    # Invoke the subcommand.
+    subcommand, suboptions, subargs = parser.parse_subcommand(subargs)
     subcommand.func(lib, suboptions, subargs)
+
     plugins.send('cli_exit', lib=lib)
 
 

@@ -60,11 +60,10 @@ class PathQuery(dbcore.FieldQuery):
 
 # Library-specific field types.
 
-
-class DateType(types.Type):
-    sql = u'REAL'
+class DateType(types.Float):
+    # TODO representation should be `datetime` object
+    # TODO distinguish beetween date and time types
     query = dbcore.query.DateQuery
-    null = 0.0
 
     def format(self, value):
         return time.strftime(beets.config['time_format'].get(unicode),
@@ -87,6 +86,7 @@ class DateType(types.Type):
 class PathType(types.Type):
     sql = u'BLOB'
     query = PathQuery
+    model_type = bytes
 
     def format(self, value):
         return util.displayable_path(value)
@@ -106,6 +106,14 @@ class PathType(types.Type):
 
         else:
             return value
+
+    def from_sql(self, sql_value):
+        return self.normalize(sql_value)
+
+    def to_sql(self, value):
+        if isinstance(value, str):
+            value = buffer(value)
+        return value
 
 
 class MusicalKey(types.String):
@@ -135,18 +143,36 @@ class MusicalKey(types.String):
             return self.parse(key)
 
 
+# Library-specific sort types.
+
+class SmartArtistSort(dbcore.query.Sort):
+    """Sort by artist (either album artist or track artist),
+    prioritizing the sort field over the raw field.
+    """
+    def __init__(self, model_cls, ascending=True):
+        self.album = model_cls is Album
+        self.ascending = ascending
+
+    def order_clause(self):
+        order = "ASC" if self.ascending else "DESC"
+        if self.album:
+            field = 'albumartist'
+        else:
+            field = 'artist'
+        return ('(CASE {0}_sort WHEN NULL THEN {0} '
+                'WHEN "" THEN {0} '
+                'ELSE {0}_sort END) {1}').format(field, order)
+
+    def sort(self, objs):
+        if self.album:
+            key = lambda a: a.albumartist_sort or a.albumartist
+        else:
+            key = lambda i: i.artist_sort or i.artist
+        return sorted(objs, key=key, reverse=not self.ascending)
+
+
 # Special path format key.
 PF_KEY_DEFAULT = 'default'
-
-
-# A little SQL utility.
-def _orelse(exp1, exp2):
-    """Generates an SQLite expression that evaluates to exp1 if exp1 is
-    non-null and non-empty or exp2 otherwise.
-    """
-    return ("""(CASE {0} WHEN NULL THEN {1}
-                         WHEN "" THEN {1}
-                         ELSE {0} END)""").format(exp1, exp2)
 
 
 # Exceptions.
@@ -196,7 +222,6 @@ class WriteError(FileOperationError):
 class LibModel(dbcore.Model):
     """Shared concrete functionality for Items and Albums.
     """
-    _bytes_keys = ('path', 'artpath')
 
     def _template_funcs(self):
         funcs = DefaultTemplateFunctions(self, self._db).functions()
@@ -214,6 +239,57 @@ class LibModel(dbcore.Model):
     def add(self, lib=None):
         super(LibModel, self).add(lib)
         plugins.send('database_change', lib=self._db)
+
+
+class FormattedItemMapping(dbcore.db.FormattedMapping):
+    """Add lookup for album-level fields.
+
+    Album-level fields take precedence if `for_path` is true.
+    """
+
+    def __init__(self, item, for_path=False):
+        super(FormattedItemMapping, self).__init__(item, for_path)
+        self.album = item.get_album()
+        self.album_keys = []
+        if self.album:
+            for key in self.album.keys(True):
+                if key in Album.item_keys or key not in item._fields.keys():
+                    self.album_keys.append(key)
+        self.all_keys = set(self.model_keys).union(self.album_keys)
+
+    def _get(self, key):
+        """Get the value for a key, either from the album or the item.
+        Raise a KeyError for invalid keys.
+        """
+        if self.for_path and key in self.album_keys:
+            return self._get_formatted(self.album, key)
+        elif key in self.model_keys:
+            return self._get_formatted(self.model, key)
+        elif key in self.album_keys:
+            return self._get_formatted(self.album, key)
+        else:
+            raise KeyError(key)
+
+    def __getitem__(self, key):
+        """Get the value for a key. Certain unset values are remapped.
+        """
+        value = self._get(key)
+
+        # `artist` and `albumartist` fields fall back to one another.
+        # This is helpful in path formats when the album artist is unset
+        # on as-is imports.
+        if key == 'artist' and not value:
+            return self._get('albumartist')
+        elif key == 'albumartist' and not value:
+            return self._get('artist')
+        else:
+            return value
+
+    def __iter__(self):
+        return iter(self.all_keys)
+
+    def __len__(self):
+        return len(self.all_keys)
 
 
 class Item(LibModel):
@@ -295,6 +371,10 @@ class Item(LibModel):
     field. Only these fields are read from disk in `read` and written in
     `write`.
     """
+
+    _formatter = FormattedItemMapping
+
+    _sorts = {'artist': SmartArtistSort}
 
     @classmethod
     def _getters(cls):
@@ -392,16 +472,19 @@ class Item(LibModel):
             path = self.path
         else:
             path = normpath(path)
+
+        tags = dict(self)
+        plugins.send('write', item=self, path=path, tags=tags)
+
         try:
-            mediafile = MediaFile(syspath(path))
-        except (OSError, IOError) as exc:
+            mediafile = MediaFile(syspath(path),
+                                  id3v23=beets.config['id3v23'].get(bool))
+        except (OSError, IOError, UnreadableFileError) as exc:
             raise ReadError(self.path, exc)
 
-        plugins.send('write', item=self, path=path)
-
-        mediafile.update(self)
+        mediafile.update(tags)
         try:
-            mediafile.save(id3v23=beets.config['id3v23'].get(bool))
+            mediafile.save()
         except (OSError, IOError, MutagenError) as exc:
             raise WriteError(self.path, exc)
 
@@ -422,6 +505,22 @@ class Item(LibModel):
         except FileOperationError as exc:
             log.error(exc)
             return False
+
+    def try_sync(self, write=None):
+        """Synchronize the item with the database and the media file
+        tags, updating them with this object's current state.
+
+        By default, the current `path` for the item is used to write
+        tags. If `write` is `False`, no tags are written. If `write` is
+        a path, tags are written to that file instead.
+
+        Similar to calling :meth:`write` and :meth:`store`.
+        """
+        if write is True:
+            write = None
+        if write is not False:
+            self.try_write(path=write)
+        self.store()
 
     # Files themselves.
 
@@ -521,12 +620,6 @@ class Item(LibModel):
 
     # Templating.
 
-    def _formatted_mapping(self, for_path=False):
-        """Get a mapping containing string-formatted values from either
-        this item or the associated album, if any.
-        """
-        return FormattedItemMapping(self, for_path)
-
     def destination(self, fragment=False, basedir=None, platform=None,
                     path_formats=None):
         """Returns the path in the library directory designated for the
@@ -546,7 +639,7 @@ class Item(LibModel):
         for query, path_format in path_formats:
             if query == PF_KEY_DEFAULT:
                 continue
-            query = get_query(query, type(self))
+            query, _ = parse_query_string(query, type(self))
             if query.match(self):
                 # The query matches the item! Use the corresponding path
                 # format.
@@ -571,8 +664,13 @@ class Item(LibModel):
             subpath = unicodedata.normalize('NFD', subpath)
         else:
             subpath = unicodedata.normalize('NFC', subpath)
+
+        if beets.config['asciify_paths']:
+            subpath = unidecode(subpath)
+
         # Truncate components and remove forbidden characters.
         subpath = util.sanitize_path(subpath, self._db.replacements)
+
         # Encode for the filesystem.
         if not fragment:
             subpath = bytestring_path(subpath)
@@ -595,56 +693,6 @@ class Item(LibModel):
             return subpath
         else:
             return normpath(os.path.join(basedir, subpath))
-
-
-class FormattedItemMapping(dbcore.db.FormattedMapping):
-    """A `dict`-like formatted view of an item that inherits album fields.
-
-    The accessor ``mapping[key]`` returns the formated version of either
-    ``item[key]`` or ``album[key]``. Here `album` is the album
-    associated to `item` if it exists.
-    """
-    def __init__(self, item, for_path=False):
-        super(FormattedItemMapping, self).__init__(item, for_path)
-        self.album = item.get_album()
-        self.album_keys = []
-        if self.album:
-            for key in self.album.keys(True):
-                if key in Album.item_keys or key not in item._fields.keys():
-                    self.album_keys.append(key)
-        self.all_keys = set(self.model_keys).union(self.album_keys)
-
-    def _get(self, key):
-        """Get the value for a key, either from the album or the item.
-        Raise a KeyError for invalid keys.
-        """
-        if key in self.album_keys:
-            return self.album._get_formatted(key, self.for_path)
-        elif key in self.model_keys:
-            return self.model._get_formatted(key, self.for_path)
-        else:
-            raise KeyError(key)
-
-    def __getitem__(self, key):
-        """Get the value for a key. Certain unset values are remapped.
-        """
-        value = self._get(key)
-
-        # `artist` and `albumartist` fields fall back to one another.
-        # This is helpful in path formats when the album artist is unset
-        # on as-is imports.
-        if key == 'artist' and not value:
-            return self._get('albumartist')
-        elif key == 'albumartist' and not value:
-            return self._get('artist')
-        else:
-            return value
-
-    def __iter__(self):
-        return iter(self.all_keys)
-
-    def __len__(self):
-        return len(self.all_keys)
 
 
 class Album(LibModel):
@@ -681,7 +729,6 @@ class Album(LibModel):
         'language':           types.STRING,
         'country':            types.STRING,
         'albumstatus':        types.STRING,
-        'media':              types.STRING,
         'albumdisambig':      types.STRING,
         'rg_album_gain':      types.NULL_FLOAT,
         'rg_album_peak':      types.NULL_FLOAT,
@@ -691,6 +738,11 @@ class Album(LibModel):
     }
 
     _search_fields = ('album', 'albumartist', 'genre')
+
+    _sorts = {
+        'albumartist': SmartArtistSort,
+        'artist': SmartArtistSort,
+    }
 
     item_keys = [
         'added',
@@ -716,7 +768,6 @@ class Album(LibModel):
         'language',
         'country',
         'albumstatus',
-        'media',
         'albumdisambig',
         'rg_album_gain',
         'rg_album_peak',
@@ -774,7 +825,9 @@ class Album(LibModel):
             return
 
         new_art = util.unique_path(new_art)
-        log.debug('moving album art %s to %s' % (old_art, new_art))
+        log.debug(u'moving album art {0} to {1}'
+                  .format(util.displayable_path(old_art),
+                          util.displayable_path(new_art)))
         if copy:
             util.copy(old_art, new_art)
         else:
@@ -830,6 +883,8 @@ class Album(LibModel):
 
         filename_tmpl = Template(beets.config['art_filename'].get(unicode))
         subpath = self.evaluate_template(filename_tmpl, True)
+        if beets.config['asciify_paths']:
+            subpath = unidecode(subpath)
         subpath = util.sanitize_path(subpath,
                                      replacements=self._db.replacements)
         subpath = bytestring_path(subpath)
@@ -884,65 +939,68 @@ class Album(LibModel):
                         item[key] = value
                     item.store()
 
+    def try_sync(self, write=True):
+        """Synchronize the album and its items with the database and
+        their files by updating them with this object's current state.
 
-# Query construction helper.
+        `write` indicates whether to write tags to the item files.
+        """
+        self.store()
+        for item in self.items():
+            item.try_sync(bool(write))
 
-def get_query(val, model_cls):
-    """Take a value which may be None, a query string, a query string
-    list, or a Query object, and return a suitable Query object.
 
-    `model_cls` is the subclass of Model indicating which entity this
-    is a query for (i.e., Album or Item) and is used to determine which
-    fields are searched.
+# Query construction helpers.
+
+def parse_query_parts(parts, model_cls):
+    """Given a beets query string as a list of components, return the
+    `Query` and `Sort` they represent.
+
+    Like `dbcore.parse_sorted_query`, with beets query prefixes and
+    special path query detection.
     """
     # Get query types and their prefix characters.
     prefixes = {':': dbcore.query.RegexpQuery}
     prefixes.update(plugins.queries())
 
-    # Convert a single string into a list of space-separated
-    # criteria.
-    if isinstance(val, basestring):
-        # A bug in Python < 2.7.3 prevents correct shlex splitting of
-        # Unicode strings.
-        # http://bugs.python.org/issue6988
-        if isinstance(val, unicode):
-            val = val.encode('utf8')
-        val = [s.decode('utf8') for s in shlex.split(val)]
-
-    if val is None:
-        return dbcore.query.TrueQuery()
-
-    elif isinstance(val, list) or isinstance(val, tuple):
-        # Special-case path-like queries, which are non-field queries
-        # containing path separators (/).
-        if 'path' in model_cls._fields:
-            path_parts = []
-            non_path_parts = []
-            for s in val:
-                if s.find(os.sep, 0, s.find(':')) != -1:
-                    # Separator precedes colon.
-                    path_parts.append(s)
-                else:
-                    non_path_parts.append(s)
-        else:
-            path_parts = ()
-            non_path_parts = val
-
-        # Parse remaining parts and construct an AndQuery.
-        query = dbcore.query_from_strings(
-            dbcore.AndQuery, model_cls, prefixes, non_path_parts
-        )
-
-        # Add path queries to aggregate query.
-        if path_parts:
-            query.subqueries += [PathQuery('path', s) for s in path_parts]
-        return query
-
-    elif isinstance(val, dbcore.Query):
-        return val
-
+    # Special-case path-like queries, which are non-field queries
+    # containing path separators (/).
+    if 'path' in model_cls._fields:
+        path_parts = []
+        non_path_parts = []
+        for s in parts:
+            if s.find(os.sep, 0, s.find(':')) != -1:
+                # Separator precedes colon.
+                path_parts.append(s)
+            else:
+                non_path_parts.append(s)
     else:
-        raise ValueError('query must be None or have type Query or str')
+        path_parts = ()
+        non_path_parts = parts
+
+    query, sort = dbcore.parse_sorted_query(
+        model_cls, non_path_parts, prefixes
+    )
+
+    # Add path queries to aggregate query.
+    if path_parts:
+        query.subqueries += [PathQuery('path', s) for s in path_parts]
+    return query, sort
+
+
+def parse_query_string(s, model_cls):
+    """Given a beets query string, return the `Query` and `Sort` they
+    represent.
+
+    The string is split into components using shell-like syntax.
+    """
+    # A bug in Python < 2.7.3 prevents correct shlex splitting of
+    # Unicode strings.
+    # http://bugs.python.org/issue6988
+    if isinstance(s, unicode):
+        s = s.encode('utf8')
+    parts = [p.decode('utf8') for p in shlex.split(s)]
+    return parse_query_parts(parts, model_cls)
 
 
 # The Library: interface to the database.
@@ -1006,30 +1064,41 @@ class Library(dbcore.Database):
 
     # Querying.
 
-    def _fetch(self, model_cls, query, order_by=None):
-        """Parse a query and fetch.
+    def _fetch(self, model_cls, query, sort=None):
+        """Parse a query and fetch. If a order specification is present
+        in the query string the `sort` argument is ignored.
         """
+        # Parse the query, if necessary.
+        parsed_sort = None
+        if isinstance(query, basestring):
+            query, parsed_sort = parse_query_string(query, model_cls)
+        elif isinstance(query, (list, tuple)):
+            query, parsed_sort = parse_query_parts(query, model_cls)
+
+        # Any non-null sort specified by the parsed query overrides the
+        # provided sort.
+        if parsed_sort and not isinstance(parsed_sort, dbcore.query.NullSort):
+            sort = parsed_sort
+
         return super(Library, self)._fetch(
-            model_cls, get_query(query, model_cls), order_by
+            model_cls, query, sort
         )
 
-    def albums(self, query=None):
-        """Get a sorted list of :class:`Album` objects matching the
-        given query.
+    def albums(self, query=None, sort=None):
+        """Get :class:`Album` objects matching the query.
         """
-        order = '{0}, album'.format(
-            _orelse("albumartist_sort", "albumartist")
+        sort = sort or dbcore.sort_from_strings(
+            Album, beets.config['sort_album'].as_str_seq()
         )
-        return self._fetch(Album, query, order)
+        return self._fetch(Album, query, sort)
 
-    def items(self, query=None):
-        """Get a sorted list of :class:`Item` objects matching the given
-        query.
+    def items(self, query=None, sort=None):
+        """Get :class:`Item` objects matching the query.
         """
-        order = '{0}, album, disc, track'.format(
-            _orelse("artist_sort", "artist")
+        sort = sort or dbcore.sort_from_strings(
+            Item, beets.config['sort_item'].as_str_seq()
         )
-        return self._fetch(Item, query, order)
+        return self._fetch(Item, query, sort)
 
     # Convenience accessors.
 
@@ -1204,7 +1273,7 @@ class DefaultTemplateFunctions(object):
             return res
 
         # Flatten disambiguation value into a string.
-        disam_value = album._get_formatted(disambiguator, True)
+        disam_value = album.formatted(True).get(disambiguator)
         res = u' [{0}]'.format(disam_value)
         self.lib._memotable[memokey] = res
         return res

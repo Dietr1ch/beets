@@ -119,6 +119,31 @@ compatibility with Windows-influenced network filesystems like Samba).
 Trailing dots and trailing whitespace, which can cause problems on Windows
 clients, are also removed.
 
+Note that paths might contain special characters such as typographical
+quotes (``“”``). With the configuration above, those will not be
+replaced as they don't match the typewriter quote (``"``). To also strip these
+special characters, you can either add them to the replacement list or use the
+:ref:`asciify-paths` configuration option below.
+
+.. _asciify-paths:
+
+asciify_paths
+~~~~~~~~~~~~~
+
+Convert all non-ASCII characters in paths to ASCII equivalents.
+
+For example, if your path template for
+singletons is ``singletons/$title`` and the title of a track is "Café",
+then the track will be saved as ``singletons/Cafe.mp3``.  The changes
+take place before applying the :ref:`replace` configuration and are roughly
+equivalent to wrapping all your path templates in the ``%asciify{}``
+:ref:`template function <template-functions>`.
+
+Default: ``no``.
+
+.. _unidecode module: http://pypi.python.org/pypi/Unidecode
+
+
 .. _art-filename:
 
 art_filename
@@ -162,6 +187,22 @@ list_format_album
 Format to use when listing *albums* with :ref:`list-cmd` and other
 commands. Defaults to ``$albumartist - $album``. The ``-f`` command-line
 option overrides this setting.
+
+.. _sort_item:
+
+sort_item
+~~~~~~~~~
+
+Default sort order to use when fetching items from the database. Defaults to
+``artist+ album+ disc+ track+``. Explicit sort orders override this default.
+
+.. _sort_album:
+
+sort_album
+~~~~~~~~~~
+
+Default sort order to use when fetching items from the database. Defaults to
+``albumartist+ album+``. Explicit sort orders override this default.
 
 .. _original_date:
 

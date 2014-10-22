@@ -45,7 +45,7 @@ if 'sdist' in sys.argv:
 
 setup(
     name='beets',
-    version='1.3.7',
+    version='1.3.9',
     description='music tagger and library organizer',
     author='Adrian Sampson',
     author_email='adrian@radbox.org',
@@ -85,12 +85,13 @@ setup(
     + (['ordereddict'] if sys.version_info < (2, 7, 0) else []),
 
     tests_require=[
-        'responses',
-        'pyechonest',
-        'mock',
+        'beautifulsoup4',
         'flask',
-        'rarfile',
+        'mock',
+        'pyechonest',
         'pylast',
+        'rarfile',
+        'responses',
     ],
 
     # Plugin (optional) dependencies:
@@ -98,7 +99,7 @@ setup(
         'beatport': ['requests'],
         'fetchart': ['requests'],
         'chroma': ['pyacoustid'],
-        'discogs': ['discogs-client'],
+        'discogs': ['discogs-client>=2.0.0'],
         'echonest': ['pyechonest'],
         'echonest_tempo': ['pyechonest'],
         'lastgenre': ['pylast'],
