@@ -15,18 +15,24 @@ Using Plugins
 To use one of the plugins included with beets (see the rest of this page for a
 list), just use the `plugins` option in your :doc:`config.yaml </reference/config>`: file, like so::
 
-    plugins: inline discogs web
+    plugins: inline convert web
 
 The value for `plugins` can be a space-separated list of plugin names or a
 YAML list like ``[foo, bar]``. You can see which plugins are currently enabled
 by typing ``beet version``.
+
+Each plugin has its own set of options that can be defined in a section bearing its name::
+
+    plugins: inline convert web
+
+    convert:
+        auto: true
 
 .. toctree::
    :hidden:
 
    chroma
    lyrics
-   echonest_tempo
    echonest
    bpd
    mpdupdate
@@ -63,6 +69,8 @@ by typing ``beet version``.
    bpm
    spotify
    types
+   lastimport
+   freedesktop
 
 Autotagger Extensions
 ---------------------
@@ -97,7 +105,8 @@ Metadata
   key from the audio.
 * :doc:`importadded`: Use file modification times for guessing the value for
   the `added` field in the database.
-* :doc:`bpm`: Determine bpm from keystrokes
+* :doc:`bpm`: Measure tempo using keystrokes.
+* :doc:`lastimport`: Collect play counts from Last.fm.
 
 .. _Acoustic Attributes: http://developer.echonest.com/acoustic-attributes.html
 .. _the Echo Nest: http://www.echonest.com
@@ -121,6 +130,7 @@ Interoperability
 * :doc:`importfeeds`: Keep track of imported files via ``.m3u`` playlist file(s) or symlinks.
 * :doc:`smartplaylist`: Generate smart playlists based on beets queries.
 * :doc:`play`: Play beets queries in your music player.
+* :doc:`freedesktop`: Create .directory files in album folders.
 
 Miscellaneous
 -------------
